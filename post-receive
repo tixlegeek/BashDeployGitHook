@@ -1,0 +1,265 @@
+#!/bin/bash
+# git auto deploy hook
+
+#
+# Configuration:
+#
+
+# Pre-production configuration
+declare -A PREPROD=(
+	['SSH_HOST']='preprod.local'
+	['SSH_USER']='deploy'
+	['SSH_IDENTITYFILE']='/home/git/ssh_preprod_deploy'
+	['DEPLOY_PATH_LOCAL']='/tmp/deploy/'
+	['DEPLOY_PATH_REMOTE']='/var/www/'
+)
+
+# Production configuration
+declare -A PROD=(
+	['SSH_HOST']='prod.local'
+	['SSH_USER']='deploy'
+	['SSH_IDENTITYFILE']='/home/git/ssh_prod_deploy'
+	['DEPLOY_PATH_LOCAL']='/tmp/deploy/'
+	['DEPLOY_PATH_REMOTE']='/var/www/'
+)
+
+# Files to be deleted before being sent to production
+GIT_FILES_CLEANUP=( "./.gitignore" "./.gitmodules" )
+# Default chown
+DEFAULT_DEPLOY_USER="www-data"
+DEFAULT_DEPLOY_GROUP="www-data"
+
+# Splash
+cat << EOF
+╔═══════════════════════════════════╗
+║ ‍💻 Tixlegeek's autoDeploy Script  ║
+╚═══════════════════════════════════╝
+EOF
+
+# Retrieve information from push
+read OLDREV NEWREV REFNAME
+BRANCH=$(git rev-parse --symbolic --abbrev-ref $REFNAME)
+REPOSITORY=$(pwd)
+PROJECT_PATH=${REPOSITORY##*/} # Repo Path
+PROJECT_NAME=${PROJECT_PATH%.*} # Repo Name
+PROJECT_CONFIG="./deploy.json"  # Deploy configuration
+
+# Return values for errors
+MSG_ERR_CLEAN_TMP=1
+MSG_ERR_CLEAN_CRUMBS=2
+MSG_ERR_CLEAN_TMPTARGET=3
+MSG_ERR_DEPLOY_LOCAL=4
+MSG_ERR_CONNECT_TEST=5
+MSG_ERR_DEPLOY_REMOTE=6
+MSG_ERR_CD_LOCAL=7
+MSG_ERR_DEPLOY_CD=8
+MSG_ERR_DEPLOY_CHOWNUSER=9
+MSG_ERR_DEPLOY_CHOWNGROUP=10
+
+# Messages for errors
+declare -A ERRMSG=(
+	[$MSG_ERR_CLEAN_TMP]="Ne peut pas supprimer le dossier temporaire."
+	[$MSG_ERR_CLEAN_CRUMBS]="Ne peut pas supprimer le dossier temporaire."
+	[$MSG_ERR_CLEAN_TMPTARGET]="Ne peut pas créer le dossier temporaire."
+	[$MSG_ERR_DEPLOY_LOCAL]="Ne peut pas déployer localement."
+	[$MSG_ERR_CONNECT_TEST]="Impossible d'établir la connexion SSH."
+	[$MSG_ERR_DEPLOY_REMOTE]="Le déploiement distant à échoué."
+	[$MSG_ERR_CD_LOCAL]="Impossible de se rendre dans le dossier local."
+	[$MSG_ERR_DEPLOY_CD]="Impossible de déployer dans le dossier configuré."
+	[$MSG_ERR_DEPLOY_CHOWNUSER]="Impossible d'attribuer l'utilisateur configuré."
+	[$MSG_ERR_DEPLOY_CHOWNGROUP]="Impossible d'attribuer le groupe configuré."
+)
+
+# debug helper
+function debugError(){
+	echo -e "\033[1;31m[x] Erreur: ${ERRMSG[$1]}\033[0m"
+}
+
+# debug helper
+function checkError(){
+	R=$?
+	if [ $R -ne 0 ]; then
+		debugError "$R"; exit 1;
+	else
+		echo -e "\033[1;32m... OK! \033[0m"
+	fi
+}
+
+# Clean tmp dir
+function cleanupTmp(){
+	TMP="$1"
+	echo "[+] Nettoyage de $TMP"
+	rm -r "$TMP" || return $MSG_ERR_CLEAN_TMP
+	return 0
+}
+
+# tmp dir initialisation
+function initTmp(){
+	TMP="$1" # local target
+
+	# Setup local tmp environnement
+	echo "[+] Préparation du dossier temporaire $TMP"
+
+	if [ -d "$TMP" ]; then
+		echo "  - Suppression de relicats... "
+		rm "$TMP" -r || return $MSG_ERR_CLEAN_CRUMBS
+	fi
+
+	echo "  - Création de la cible temporaire... "
+	mkdir -p "$TMP" || return $MSG_ERR_CLEAN_TMPTARGET
+	return 0
+}
+
+# Check variable from jq output
+function checkJqVar(){
+	[ -z "$1" -o "$1" == "null" ] && return 1 || return 0
+}
+
+# Script to be executed locally, before remote deployment
+function preDeployScript(){
+	if [ -f $PROJECT_CONFIG ]; then
+		# Récupère le contenu du fichier de configuration (json)
+		echo "[+] Script de configuration $PROJECT_CONFIG présent"
+		PROJECT_CONFIG_VAR=$(cat $PROJECT_CONFIG)
+		echo "  - Configuration:"
+
+		# chown configuration, and default fallback
+		DEPLOY_USER=$(echo "$PROJECT_CONFIG_VAR" | jq -r .user )
+		checkJqVar $DEPLOY_USER || DEPLOY_USER=$DEFAULT_DEPLOY_USER
+		echo -e "    -‍ user:\t$DEPLOY_USER "
+
+		DEPLOY_GROUP=$(echo "$PROJECT_CONFIG_VAR" | jq -r .group )
+		checkJqVar $DEPLOY_GROUP || DEPLOY_GROUP=$DEFAULT_DEPLOY_GROUP
+		echo -e "    - group:\t$DEPLOY_GROUP "
+
+		DEPLOY_DIR=$(echo "$PROJECT_CONFIG_VAR" | jq -r .dir )
+		checkJqVar $DEPLOY_DIR && echo -e "    - dir:\t$DEPLOY_DIR "
+	else
+		echo " ... Aucun script à exécuter après déploiement."
+	fi
+	preDeployScriptClean
+}
+
+# Script called to clean local dir before deployment
+function preDeployScriptClean(){
+	echo "[+] Nettoyage avant mise en production... "
+	if [ -f $PROJECT_CONFIG ]; then
+		rm "$PROJECT_CONFIG"
+		echo "    - Removing $PROJECT_CONFIG"
+	fi
+	for FILES in "${GIT_FILES_CLEANUP[@]}"; do
+		if [ -f $FILES ]; then
+			rm "$FILES"
+			echo "    - Removing $FILES"
+		fi
+	done
+	ls ./
+}
+
+# Local deployment
+function deployLocal(){
+	TMP="$1" # local target
+	DIR="$2" # local repo
+	BCH="$3" # branch
+
+	# Deploy git to tmp file
+	echo "[+] Déploiement local [ $DIR -> $TMP ]"
+
+	git --work-tree=$TMP --git-dir=$DIR checkout "$BCH" -f 2>/dev/null  || return $MSG_ERR_DEPLOY_LOCAL
+
+	echo "  - Entre dans $TMP ... "
+	pushd $TMP 1> /dev/null || return $MSG_ERR_CD_LOCAL
+	preDeployScript
+	echo "  - Sort de $TMP ... "
+	popd 1> /dev/null
+	return 0
+}
+
+# Remote deployment
+function deployRemote(){
+	TMP="$1" # local target
+	SSH_TARGET="$2" # Remote target
+	SSH_PATH="$3" # ssh dst path
+	SSH_IDENTITYFILE="$4" # ssh key file
+
+	# Deploy from local to remote target
+	echo "[+] Déploiement distant [ $TMP -> $SSH_TARGET ]"
+
+	echo "  - Test de la connexion SSH vers ${SSH_TARGET}..."
+	echo "    ▸ ssh -q "${SSH_TARGET}" exit "
+	ssh -q -i "${SSH_IDENTITYFILE}" "${SSH_TARGET}" exit 2>/dev/null || return $MSG_ERR_CONNECT_TEST
+
+	echo "  - Envoi du code vers ${SSH_TARGET}:${SSH_PATH}..."
+
+	#echo "    ▸ scp -r "${TMP}" "${SSH_TARGET}":"${SSH_PATH}" "
+	#	scp -r -i "${SSH_IDENTITYFILE}" "${TMP}" "${SSH_TARGET}:${SSH_PATH}" 2>/dev/null || return $MSG_ERR_DEPLOY_REMOTE
+
+	echo "    ▸ ssh "${SSH_TARGET}" sudo chown deploy:deploy ${SSH_PATH} -R "
+	ssh -q -i "${SSH_IDENTITYFILE}" "${SSH_TARGET}" sudo chown deploy:deploy ${SSH_PATH} -R 2>/dev/null
+
+	echo "    ▸ rsync -O --delete -r -p -t -z -e \"ssh [...]]\" "${TMP}" "${SSH_TARGET}":"${SSH_PATH}
+	rsync -O --delete -r -p -t -z -e "ssh -i ${SSH_IDENTITYFILE}" "${TMP}" "${SSH_TARGET}:${SSH_PATH}" || return $MSG_ERR_DEPLOY_REMOTE
+
+	# Can choose destination name, but not implemented yet
+	# checkJqVar $DEPLOY_DIR && echo "  • CD "
+	#  2>/dev/null || return $MSG_ERR_DEPLOY_CD
+
+	deployRights "${TMP}" "${SSH_TARGET}" "${SSH_PATH}" "${SSH_IDENTITYFILE}"
+	DEPLOY_RIGHTS=$?;
+	[ $DEPLOY_RIGHTS -ne 0 ] && return $DEPLOY_RIGHTS
+
+	return 0
+}
+
+# Setting up rights
+function deployRights(){
+	TMP="$1" # local target
+	SSH_TARGET="$2" # Remote target
+	SSH_PATH="$3" # ssh dst path
+	SSH_IDENTITYFILE="$4" # ssh key file
+	# Change les droits du dossier déployé
+	if checkJqVar $DEPLOY_USER ; then
+		echo "  - chown user $DEPLOY_USER"
+		echo "    ▸ ssh "${SSH_TARGET}" sudo chown ${DEPLOY_USER} ${SSH_PATH} -R"
+		ssh -q -i "${SSH_IDENTITYFILE}" "${SSH_TARGET}" sudo chown ${DEPLOY_USER} ${SSH_PATH} -R || return $MSG_ERR_DEPLOY_CHOWNUSER
+	fi
+	if checkJqVar $DEPLOY_GROUP ; then
+		echo "  - chown group $DEPLOY_GROUP"
+		echo "    ▸ ssh "${SSH_TARGET}" sudo chown :${DEPLOY_GROUP} ${SSH_PATH} -R"
+		ssh -q -i "${SSH_IDENTITYFILE}" "${SSH_TARGET}" sudo chown :${DEPLOY_GROUP} ${SSH_PATH} -R || return $MSG_ERR_DEPLOY_CHOWNGROUP
+	fi
+}
+
+# branch-dependant deploy
+case $BRANCH in
+	"prod" )
+		echo "[+] Déploiement sur ${BRANCH^^} ..."
+		# Initialise local temporary dir
+		initTmp ${PROD[DEPLOY_PATH_LOCAL]}
+		checkError
+		# Locally deploy the code
+		deployLocal ${PROD[DEPLOY_PATH_LOCAL]} ${REPOSITORY} ${BRANCH}
+		checkError
+		# Deploy the local code to remote
+		deployRemote ${PROD[DEPLOY_PATH_LOCAL]} ${PROD[SSH_USER]}"@"${PROD[SSH_HOST]} ${PROD[DEPLOY_PATH_REMOTE]}${PROJECT_NAME} ${PROD[SSH_IDENTITYFILE]}
+		checkError
+		# Clean locally deployed stuff
+		cleanupTmp ${PROD[DEPLOY_PATH_LOCAL]}
+		checkError
+		;;
+	"preprod" )
+		echo "[+] Déploiement sur ${BRANCH^^} ..."
+		# Initialise local temporary dir
+		initTmp ${PREPROD[DEPLOY_PATH_LOCAL]}
+		checkError
+		# Locally deploy the code
+		deployLocal ${PREPROD[DEPLOY_PATH_LOCAL]} ${REPOSITORY} ${BRANCH}
+		checkError
+		# Deploy the local code to remote
+		deployRemote ${PREPROD[DEPLOY_PATH_LOCAL]} ${PREPROD[SSH_USER]}"@"${PREPROD[SSH_HOST]} ${PREPROD[DEPLOY_PATH_REMOTE]}${PROJECT_NAME} ${PREPROD[SSH_IDENTITYFILE]}
+		checkError
+		# Clean locally deployed stuff
+		cleanupTmp ${PREPROD[DEPLOY_PATH_LOCAL]}
+		checkError
+		;;
+esac
